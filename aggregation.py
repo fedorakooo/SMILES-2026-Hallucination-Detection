@@ -18,6 +18,20 @@ single entry point called from the notebook.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+
+def _real_token_states(layer_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    real_idx = torch.nonzero(attention_mask > 0, as_tuple=False).squeeze(-1)
+    if real_idx.numel() == 0:
+        return layer_states[:1]
+    return layer_states[real_idx]
+
+
+def _selected_layer_indices(n_layers: int) -> list[int]:
+    anchors = [max(0, n_layers // 4), max(0, n_layers // 2), max(0, (3 * n_layers) // 4), n_layers - 1]
+    unique_sorted = sorted(set(anchors))
+    return unique_sorted
 
 
 def aggregate(
@@ -45,15 +59,26 @@ def aggregate(
     # STUDENT: Replace or extend the aggregation below.
     # ------------------------------------------------------------------
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    n_layers, _, hidden_dim = hidden_states.shape
+    layer_ids = _selected_layer_indices(n_layers)
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    pooled_parts: list[torch.Tensor] = []
+    for layer_id in layer_ids:
+        token_states = _real_token_states(hidden_states[layer_id], attention_mask)
+        mean_pool = token_states.mean(dim=0)
+        max_pool = token_states.max(dim=0).values
+        last_pool = token_states[-1]
+        pooled_parts.extend([mean_pool, max_pool, last_pool])
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    final_layer_tokens = _real_token_states(hidden_states[-1], attention_mask)
+    tail_len = max(1, int(0.4 * final_layer_tokens.size(0)))
+    answer_tail_mean = final_layer_tokens[-tail_len:].mean(dim=0)
+    pooled_parts.append(answer_tail_mean)
 
+    feature = torch.cat(pooled_parts, dim=0)
+
+    if feature.numel() == 0:
+        return torch.zeros(hidden_dim, dtype=hidden_states.dtype)
     return feature
     # ------------------------------------------------------------------
 
@@ -85,8 +110,55 @@ def extract_geometric_features(
     # STUDENT: Replace or extend the geometric feature extraction below.
     # ------------------------------------------------------------------
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    n_layers, seq_len, _ = hidden_states.shape
+    layer_ids = _selected_layer_indices(n_layers)
+    final_tokens = _real_token_states(hidden_states[-1], attention_mask)
+    n_real = int(final_tokens.size(0))
+
+    frac_real = float(n_real) / max(seq_len, 1)
+    token_center = final_tokens.mean(dim=0, keepdim=True)
+    token_spread = torch.norm(final_tokens - token_center, dim=1)
+
+    layer_means: list[torch.Tensor] = []
+    layer_norm_means: list[torch.Tensor] = []
+    layer_norm_stds: list[torch.Tensor] = []
+    for layer_id in layer_ids:
+        layer_tokens = _real_token_states(hidden_states[layer_id], attention_mask)
+        mean_vec = layer_tokens.mean(dim=0)
+        norms = torch.norm(layer_tokens, dim=1)
+        layer_means.append(mean_vec)
+        layer_norm_means.append(norms.mean())
+        layer_norm_stds.append(norms.std(unbiased=False))
+
+    pairwise_cos: list[torch.Tensor] = []
+    if len(layer_means) >= 2:
+        for i in range(len(layer_means) - 1):
+            pairwise_cos.append(
+                F.cosine_similarity(layer_means[i], layer_means[i + 1], dim=0)
+            )
+    else:
+        pairwise_cos.append(torch.tensor(1.0, dtype=hidden_states.dtype))
+
+    edge_cos = F.cosine_similarity(layer_means[0], layer_means[-1], dim=0)
+
+    geo = torch.tensor(
+        [
+            float(n_real),
+            float(seq_len),
+            frac_real,
+            float(token_spread.mean()),
+            float(token_spread.std(unbiased=False)),
+            float(torch.stack(layer_norm_means).mean()),
+            float(torch.stack(layer_norm_means).std(unbiased=False)),
+            float(torch.stack(layer_norm_stds).mean()),
+            float(torch.stack(layer_norm_stds).std(unbiased=False)),
+            float(torch.stack(pairwise_cos).mean()),
+            float(torch.stack(pairwise_cos).std(unbiased=False)),
+            float(edge_cos),
+        ],
+        dtype=hidden_states.dtype,
+    )
+    return geo
 
 
 def aggregation_and_feature_extraction(

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
@@ -30,6 +31,14 @@ class HallucinationProbe(nn.Module):
         self._net: nn.Sequential | None = None  # built lazily in fit()
         self._scaler = StandardScaler()
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._seed: int = 42
+        self._batch_size: int = 64
+        self._max_epochs: int = 250
+        self._patience: int = 25
+
+    def _set_seed(self) -> None:
+        np.random.seed(self._seed)
+        torch.manual_seed(self._seed)
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
@@ -42,11 +51,29 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        bottleneck_dim = min(512, max(128, input_dim // 2))
+        hidden_dim = min(256, max(96, bottleneck_dim // 2))
+
+        if input_dim > bottleneck_dim:
+            self._net = nn.Sequential(
+                nn.Linear(input_dim, bottleneck_dim),
+                nn.LayerNorm(bottleneck_dim),
+                nn.GELU(),
+                nn.Dropout(0.20),
+                nn.Linear(bottleneck_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.15),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self._net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.15),
+                nn.Linear(hidden_dim, 1),
+            )
 
     # ------------------------------------------------------------------
 
@@ -79,33 +106,98 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
-        X_scaled = self._scaler.fit_transform(X)
+        self._set_seed()
+        X_scaled = self._scaler.fit_transform(X).astype(np.float32)
+        y_float = y.astype(np.float32)
 
         self._build_network(X_scaled.shape[1])
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        idx_all = np.arange(len(y))
+        can_stratify = len(np.unique(y)) > 1 and np.min(np.bincount(y.astype(int))) >= 2
+        use_internal_val = len(y) >= 40 and can_stratify
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
+        if use_internal_val:
+            idx_train, idx_val = train_test_split(
+                idx_all,
+                test_size=0.2,
+                random_state=self._seed,
+                stratify=y,
+            )
+        else:
+            idx_train, idx_val = idx_all, None
+
+        X_train = torch.from_numpy(X_scaled[idx_train]).float()
+        y_train = torch.from_numpy(y_float[idx_train])
+
+        X_val = None
+        y_val = None
+        if idx_val is not None:
+            X_val = torch.from_numpy(X_scaled[idx_val]).float()
+            y_val = torch.from_numpy(y_float[idx_val])
+
+        n_pos = int(y_train.sum().item())
+        n_neg = int(y_train.numel() - n_pos)
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=8e-4, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=8,
+            min_lr=1e-5,
+        )
 
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
+        best_score = float("inf")
+        best_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+        bad_epochs = 0
+        min_delta = 1e-4
 
+        for _ in range(self._max_epochs):
+            self.train()
+            perm = torch.randperm(X_train.size(0))
+            epoch_loss = 0.0
+
+            for start in range(0, X_train.size(0), self._batch_size):
+                batch_idx = perm[start : start + self._batch_size]
+                xb = X_train[batch_idx]
+                yb = y_train[batch_idx]
+
+                optimizer.zero_grad()
+                logits = self(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += float(loss.item()) * xb.size(0)
+
+            train_loss = epoch_loss / max(X_train.size(0), 1)
+
+            self.eval()
+            with torch.no_grad():
+                if X_val is not None and y_val is not None:
+                    val_logits = self(X_val)
+                    val_loss = float(criterion(val_logits, y_val).item())
+                    score = val_loss
+                else:
+                    score = train_loss
+
+            scheduler.step(score)
+
+            if score < best_score - min_delta:
+                best_score = score
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in self.state_dict().items()
+                }
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+
+            if bad_epochs >= self._patience:
+                break
+
+        self.load_state_dict(best_state)
         self.eval()
         return self
 

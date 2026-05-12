@@ -18,7 +18,26 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+def _validate_split(
+    idx_train: np.ndarray,
+    idx_val: np.ndarray | None,
+    idx_test: np.ndarray,
+    n_samples: int,
+) -> None:
+    parts = [idx_train, idx_test] if idx_val is None else [idx_train, idx_val, idx_test]
+    sets = [set(map(int, p.tolist())) for p in parts]
+
+    union = set().union(*sets)
+    if union != set(range(n_samples)):
+        raise ValueError("Split indices must cover all rows exactly once.")
+
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            if sets[i].intersection(sets[j]):
+                raise ValueError("Split indices must be non-overlapping.")
 
 
 def split_data(
@@ -51,20 +70,56 @@ def split_data(
         function returns the list described above.
     """
 
-    idx = np.arange(len(y))
+    n_samples = len(y)
+    idx = np.arange(n_samples, dtype=int)
+    y = np.asarray(y).astype(int)
 
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
+    if n_samples < 10 or len(np.unique(y)) < 2:
+        idx_train, idx_test = train_test_split(
+            idx,
+            test_size=min(max(test_size, 0.1), 0.5),
+            random_state=random_state,
+            shuffle=True,
+        )
+        idx_train, idx_test = np.asarray(idx_train, dtype=int), np.asarray(idx_test, dtype=int)
+        idx_val = None
+        _validate_split(idx_train, idx_val, idx_test, n_samples)
+        return [(idx_train, idx_val, idx_test)]
+
+    class_counts = np.bincount(y)
+    min_class = int(class_counts.min()) if class_counts.size > 1 else 1
+    n_splits = max(2, min(5, min_class))
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
+
+    for idx_train_full, idx_test in skf.split(idx, y):
+        idx_train_full = idx[idx_train_full]
+        idx_test = idx[idx_test]
+
+        val_fraction = min(max(val_size, 0.05), 0.35)
+        can_make_val = (
+            len(np.unique(y[idx_train_full])) > 1
+            and np.min(np.bincount(y[idx_train_full])) >= 2
+            and len(idx_train_full) >= 20
+        )
+
+        if can_make_val:
+            idx_train, idx_val = train_test_split(
+                idx_train_full,
+                test_size=val_fraction,
+                random_state=random_state,
+                stratify=y[idx_train_full],
+            )
+        else:
+            idx_train, idx_val = idx_train_full, None
+
+        idx_train = np.asarray(idx_train, dtype=int)
+        idx_test = np.asarray(idx_test, dtype=int)
+        idx_val = None if idx_val is None else np.asarray(idx_val, dtype=int)
+
+        _validate_split(idx_train, idx_val, idx_test, n_samples)
+        splits.append((idx_train, idx_val, idx_test))
+
+    return splits
 
